@@ -388,6 +388,7 @@ def instrument_claude_client(original_class: Any) -> Any:
                             event_type = event.get('type')
                             if event_type == 'message_start':
                                 # Contains input tokens and initial output tokens
+                                # IMPORTANT: Always arrives BEFORE AssistantMessage, so we must buffer
                                 message_data = event.get('message', {})
                                 usage = message_data.get('usage', {})
                                 if usage:
@@ -409,8 +410,11 @@ def instrument_claude_client(original_class: Any) -> Any:
                                             usage_metadata['input_token_details']['cache_read'] = cache_read
                                         if cache_create:
                                             usage_metadata['input_token_details']['cache_creation'] = cache_create
-                                    # Add to current LLM run
-                                    tracker.add_usage(usage_metadata)
+                                    # ALWAYS buffer message_start usage (will be applied when AssistantMessage creates run)
+                                    if tracker.pending_usage:
+                                        tracker.pending_usage = {**tracker.pending_usage, **usage_metadata}
+                                    else:
+                                        tracker.pending_usage = usage_metadata
                             elif event_type == 'message_delta':
                                 # Update output tokens (cumulative from Anthropic)
                                 delta_usage = event.get('usage', {})
