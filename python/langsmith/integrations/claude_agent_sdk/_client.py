@@ -55,13 +55,15 @@ class TurnLifecycle:
         self.next_start_time = time.time()
 
     def add_usage(self, metrics: dict[str, Any]) -> None:
-        """Attach token usage details to the current run."""
+        """Attach token usage details to the current run using validated API."""
         if not (self.current_run and metrics):
             return
-        meta = self.current_run.extra.setdefault("metadata", {}).setdefault(
-            "usage_metadata", {}
-        )
-        meta.update(metrics)
+        # Get existing usage metadata
+        existing = self.current_run.extra.get("metadata", {}).get("usage_metadata", {})
+        # Merge with new metrics (allows incremental updates)
+        merged = {**existing, **metrics}
+        # Use RunTree.set() for schema validation and dashboard compatibility
+        self.current_run.set(usage_metadata=merged)
 
     def close(self) -> None:
         """End any open run gracefully."""
@@ -363,17 +365,57 @@ def instrument_claude_client(original_class: Any) -> Any:
                                         }
                                     )
                             tracker.mark_next_start()
+                        elif msg_type == "StreamEvent":
+                            # Extract per-turn usage from Anthropic streaming events
+                            event = getattr(msg, 'event', {})
+                            event_type = event.get('type')
+                            if event_type == 'message_start':
+                                # Contains input tokens and initial output tokens
+                                message_data = event.get('message', {})
+                                usage = message_data.get('usage', {})
+                                if usage:
+                                    # Extract tokens
+                                    input_tokens = usage.get('input_tokens', 0)
+                                    output_tokens = usage.get('output_tokens', 0)
+                                    cache_read = usage.get('cache_read_input_tokens', 0)
+                                    cache_create = usage.get('cache_creation_input_tokens', 0)
+                                    # Build validated usage metadata
+                                    usage_metadata = {
+                                        'input_tokens': input_tokens,
+                                        'output_tokens': output_tokens,
+                                        'total_tokens': input_tokens + output_tokens + cache_read + cache_create,
+                                    }
+                                    # Add cache details if present
+                                    if cache_read or cache_create:
+                                        usage_metadata['input_token_details'] = {}
+                                        if cache_read:
+                                            usage_metadata['input_token_details']['cache_read'] = cache_read
+                                        if cache_create:
+                                            usage_metadata['input_token_details']['cache_creation'] = cache_create
+                                    # Add to current LLM run
+                                    tracker.add_usage(usage_metadata)
+                            elif event_type == 'message_delta':
+                                # Update output tokens (cumulative from Anthropic)
+                                delta_usage = event.get('usage', {})
+                                if delta_usage and 'output_tokens' in delta_usage:
+                                    output_tokens = delta_usage['output_tokens']
+                                    # Update current run's output tokens
+                                    if tracker.current_run:
+                                        current_meta = tracker.current_run.extra.get('metadata', {}).get('usage_metadata', {})
+                                        input_tokens = current_meta.get('input_tokens', 0)
+                                        # Recalculate total including cache tokens
+                                        input_details = current_meta.get('input_token_details', {})
+                                        cache_read = input_details.get('cache_read', 0)
+                                        cache_create = input_details.get('cache_creation', 0)
+                                        tracker.add_usage({
+                                            'output_tokens': output_tokens,
+                                            'total_tokens': input_tokens + output_tokens + cache_read + cache_create,
+                                        })
                         elif msg_type == "ResultMessage":
-                            # Add usage metrics including cost
-                            if hasattr(msg, "usage"):
-                                usage = extract_usage_from_result_message(msg)
-                                # Add total_cost to usage_metadata if available
-                                if (
-                                    hasattr(msg, "total_cost_usd")
-                                    and msg.total_cost_usd is not None
-                                ):
-                                    usage["total_cost"] = msg.total_cost_usd
-                                tracker.add_usage(usage)
+                            # Per-turn usage already added via StreamEvent
+                            # Only add conversation-level cost to metadata
+                            if hasattr(msg, "total_cost_usd") and msg.total_cost_usd is not None:
+                                run.metadata["total_cost"] = msg.total_cost_usd
 
                             # Add conversation-level metadata
                             meta = {
