@@ -99,16 +99,20 @@ class TestTurnLifecycleAddUsage:
         assert result['input_token_details']['cache_read'] == 400
         assert result['input_token_details']['cache_creation'] == 100
 
-    def test_add_usage_no_current_run(self):
-        """Test that add_usage does nothing when no current run exists."""
+    def test_add_usage_no_current_run_buffers(self):
+        """Test that add_usage buffers usage when no current run exists."""
         tracker = TurnLifecycle()
         # No current_run set
 
-        usage_metadata = {'input_tokens': 100}
+        usage_metadata = {'input_tokens': 100, 'output_tokens': 50}
 
-        # Should not raise an error
+        # Should buffer the usage
         tracker.add_usage(usage_metadata)
-        # Nothing to assert - just verify it doesn't crash
+
+        # Verify it was buffered
+        assert tracker.pending_usage is not None
+        assert tracker.pending_usage['input_tokens'] == 100
+        assert tracker.pending_usage['output_tokens'] == 50
 
     def test_add_usage_empty_metrics(self):
         """Test that add_usage does nothing with empty metrics."""
@@ -123,6 +127,47 @@ class TestTurnLifecycleAddUsage:
 
         # Should not call set() with empty metrics
         mock_run.set.assert_not_called()
+
+    def test_pending_usage_applied_on_run_creation(self):
+        """Test that buffered pending usage is applied when run is created."""
+        tracker = TurnLifecycle()
+
+        # Add usage before run exists (will be buffered)
+        tracker.add_usage({
+            'input_tokens': 1000,
+            'output_tokens': 0,
+            'total_tokens': 26000,
+            'input_token_details': {'cache_read': 25000}
+        })
+
+        # Verify it was buffered
+        assert tracker.pending_usage is not None
+
+        # Now create a run (simulating AssistantMessage arrival)
+        mock_run = Mock()
+        mock_run.extra = {}
+        mock_run.set = Mock()
+        mock_run.end = Mock()
+        mock_run.patch = Mock()
+
+        # Mock begin_llm_run_from_assistant_messages to return our mock run
+        from unittest.mock import patch as mock_patch
+        with mock_patch('langsmith.integrations.claude_agent_sdk._client.begin_llm_run_from_assistant_messages',
+                       return_value=(None, mock_run)):
+            tracker.start_llm_run(Mock(), "test prompt", [])
+
+        # Verify pending usage was applied to the run
+        mock_run.set.assert_called_once()
+        call_args = mock_run.set.call_args
+        usage = call_args.kwargs['usage_metadata']
+
+        assert usage['input_tokens'] == 1000
+        assert usage['total_tokens'] == 26000
+        assert 'input_token_details' in usage
+        assert usage['input_token_details']['cache_read'] == 25000
+
+        # Verify pending buffer was cleared
+        assert tracker.pending_usage is None
 
 
 class MockStreamEvent:

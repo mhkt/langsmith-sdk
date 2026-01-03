@@ -28,6 +28,7 @@ class TurnLifecycle:
     def __init__(self, query_start_time: Optional[float] = None):
         self.current_run: Optional[Any] = None
         self.next_start_time: Optional[float] = query_start_time
+        self.pending_usage: Optional[dict[str, Any]] = None  # Buffer for usage before run is created
 
     def start_llm_run(
         self,
@@ -48,6 +49,12 @@ class TurnLifecycle:
         )
         self.current_run = run
         self.next_start_time = None
+
+        # Apply any pending usage that arrived before this run was created
+        if self.pending_usage:
+            self.add_usage(self.pending_usage)
+            self.pending_usage = None
+
         return final_output
 
     def mark_next_start(self) -> None:
@@ -56,8 +63,18 @@ class TurnLifecycle:
 
     def add_usage(self, metrics: dict[str, Any]) -> None:
         """Attach token usage details to the current run using validated API."""
-        if not (self.current_run and metrics):
+        if not metrics:
             return
+
+        # If no run exists yet, buffer the usage for when the run is created
+        if not self.current_run:
+            if self.pending_usage:
+                # Merge with existing pending usage
+                self.pending_usage = {**self.pending_usage, **metrics}
+            else:
+                self.pending_usage = metrics
+            return
+
         # Get existing usage metadata
         existing = self.current_run.extra.get("metadata", {}).get("usage_metadata", {})
         # Merge with new metrics (allows incremental updates)
